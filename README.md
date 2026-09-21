@@ -33,6 +33,7 @@ A Python package based on <a href="https://jax.readthedocs.io"> JAX </a> for lin
   - [Acknowledgments](#acknowledgments)
   - [Citing jax-sysid](#citing-jax-sysid)
   - [License](#license)
+  - [Acknowledgement](#acknowledgement)
 
 
 <a name="description"></a>
@@ -656,3 +657,10 @@ os.environ["XLA_FLAGS"] = (
 Apache 2.0
 
 (C) 2024 A. Bemporad
+
+## Acknowledgement
+This work was partially supported by the European Union (ERC Advanced Research Grant COMPACT, No. 101141351). Views and opinions expressed are however those of the authors only and do not necessarily reflect those of the European Union or the European Research Council. Neither the European Union nor the granting authority can be held responsible for them.
+
+<p align="center">
+<img src="erc-logo.png" alt="ERC" width="400"/>
+</p>
