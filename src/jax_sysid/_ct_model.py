@@ -530,15 +530,22 @@ class CTModel(Model):
             get_score = fit
 
         def single_score(k):
+            model = models[k]
+            initial_states = model.x0
             experiment_scores = []
-            for i in range(Nexp):
-                x0 = models[k].learn_x0(
-                    U_experiments[i], Y_experiments[i], T_experiments[i],
-                    Tu_experiments[i])
-                Yhat, _ = models[k].predict(
-                    x0, U_experiments[i], T_experiments[i], Tu_experiments[i])
-                experiment_scores.append(
-                    get_score(Y_experiments[i], Yhat))
+            try:
+                for i in range(Nexp):
+                    if isinstance(initial_states, list):
+                        model.x0 = initial_states[i]
+                    x0 = model.learn_x0(
+                        U_experiments[i], Y_experiments[i], T_experiments[i],
+                        Tu_experiments[i])
+                    Yhat, _ = model.predict(
+                        x0, U_experiments[i], T_experiments[i], Tu_experiments[i])
+                    experiment_scores.append(
+                        get_score(Y_experiments[i], Yhat))
+            finally:
+                model.x0 = initial_states
             return np.sum(experiment_scores, axis=0)
 
         if len(models) == 1:
