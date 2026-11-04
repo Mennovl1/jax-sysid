@@ -293,6 +293,11 @@ class Model(object):
         """Compute the output loss for one experiment."""
         return self.output_loss(Yhat, Y)
 
+    def _predict_experiments(self, x0, U, params, forward_step):
+        """Predict all experiments, allowing subclasses to batch the operation."""
+        return [self._predict_experiment(x0[i], U[i], params, i, forward_step)
+                for i in range(len(U))]
+
     def _fit_state_trajectory(self, x0, U, experiment_index):
         """Return the state trajectory used by the post-fit saturation check."""
         return Model.predict(self, x0, U, 0, 0)[1]
@@ -470,10 +475,9 @@ class Model(object):
                 """
                 f = partial(SS_forward, th=th, sat=self.xsat)
                 cost = 0.
+                Yhats = self._predict_experiments(x0, U, th, f)
                 for i in range(Nexp):
-                    Yhat = self._predict_experiment(
-                        x0[i], U[i], th, i, f)
-                    cost += self._loss_experiment(Yhat, Y[i], i)
+                    cost += self._loss_experiment(Yhats[i], Y[i], i)
                 return cost
 
             t_solve = time.time()

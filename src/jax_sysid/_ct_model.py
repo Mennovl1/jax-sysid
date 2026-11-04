@@ -89,8 +89,8 @@ class CTModel(Model):
             for k in range(self.nu):
                 if iszoh:
                     # ZOH interpolation, with u(t) = u[k] for t in [Tu[k],Tu[k+1])
-                    Tc, Uc = diffrax.rectilinear_interpolation(np.hstack((
-                        -(Tu[1]-Tu[0]),Tu)), np.hstack((U[:,k],U[-1,k])))
+                    Tc, Uc = diffrax.rectilinear_interpolation(jnp.hstack((
+                        -(Tu[1]-Tu[0]),Tu)), jnp.hstack((U[:,k],U[-1,k])))
                     input_fcn.append(diffrax.LinearInterpolation(ts=Tc, ys=Uc))
                 else:
                     input_fcn.append(diffrax.LinearInterpolation(ts=Tu, ys=U[:,k]))
@@ -167,50 +167,66 @@ class CTModel(Model):
             self.custom_regularization = custom_regularization
         return
 
+    def _make_fit_functions_(self):
+        """Build JIT-compiled prediction functions with data passed as arguments."""
+        output_values = jax.vmap(self.output_fcn_ct, in_axes=[0, 0, 0, None])
+
+        @jax.jit
+        def state_prediction(x, U, T, Tu, params):
+            input_fcn = self.input_fcn_gen(Tu, U)
+            dt0 = self.dt0_fcn(Tu)
+
+            def dxdt(t, x, params):
+                u = jnp.array([input_fcn[k].evaluate(t)
+                               for k in range(self.nu)]).reshape(self.nu)
+                return self.state_fcn_ct(x, u, t, params)
+
+            term = diffrax.ODETerm(dxdt)
+            saveat = diffrax.SaveAt(ts=T)
+            if self.stepsize_controller is None:
+                sol = diffrax.diffeqsolve(
+                    term, self.ode_solver, t0=T[0], t1=T[-1], dt0=dt0,
+                    y0=x, args=params, saveat=saveat, max_steps=self.max_steps)
+            else:
+                sol = diffrax.diffeqsolve(
+                    term, self.ode_solver, t0=T[0], t1=T[-1], dt0=dt0,
+                    y0=x, args=params, saveat=saveat, max_steps=self.max_steps,
+                    stepsize_controller=self.stepsize_controller)
+            return sol.ys
+
+        @jax.jit
+        def output_prediction(x, U, T, Tu, params):
+            X = state_prediction(x, U, T, Tu, params)
+            input_fcn = self.input_fcn_gen(Tu, U)
+            Uy = jnp.array([input_fcn[k].evaluate(T)
+                            for k in range(self.nu)]).reshape(-1, self.nu)
+            return output_values(X, Uy, T, params).reshape(-1)
+
+        @jax.jit
+        def state_fcn(x, u, params):
+            return x
+        self.state_fcn = state_fcn
+        return state_prediction, output_prediction
+
+    def _bind_fit_experiment_(self, U, T, Tu, state_prediction, output_prediction):
+        """Bind shared prediction functions to one experiment for legacy attributes."""
+        @jax.jit
+        def state_prediction_one(x, u, params):
+            return state_prediction(x, U, T, Tu, params)
+
+        @jax.jit
+        def output_prediction_one(x, u, params):
+            return output_prediction(x, U, T, Tu, params)
+
+        return state_prediction_one, output_prediction_one
+
     def _prepare_fit_experiment_(self, U, T, Tu):
         """Prepare interpolation and prediction functions for one experiment."""
         if Tu is None:
             Tu = T
-
-        input_fcn = self.input_fcn_gen(Tu, U)
-        dt0 = self.dt0_fcn(Tu)
-
-        @jax.jit
-        def dxdt(t, x, params):
-            u = jnp.array([input_fcn[k].evaluate(t) for k in range(self.nu)]).reshape(self.nu)
-            return self.state_fcn_ct(x, u, t, params)
-
-        @jax.jit
-        def state_fcn(x, u, params):
-            return x  # do nothing, just return the state
-        self.state_fcn = state_fcn
-
-        # evaluate input at output sample points
-        Uy = jnp.array([input_fcn[k].evaluate(T) for k in range(self.nu)]).reshape(-1,self.nu)
-        output_values = jax.jit(
-            jax.vmap(self.output_fcn_ct, in_axes=[0, 0, 0, None]))
-
-        @jax.jit
-        def state_prediction(x, u, params):
-            term = diffrax.ODETerm(dxdt)
-            t0 = T[0]
-            t1 = T[-1]
-            saveat = diffrax.SaveAt(ts=jnp.array(T))
-            if self.stepsize_controller is None:
-                sol = diffrax.diffeqsolve(term, self.ode_solver, t0=t0, t1=t1, dt0=dt0,
-                                          y0=x, args=params, saveat=saveat, max_steps=self.max_steps)
-            else:
-                sol = diffrax.diffeqsolve(term, self.ode_solver, t0=t0, t1=t1, dt0=dt0, y0=x, args=params,
-                                          saveat=saveat, max_steps=self.max_steps, stepsize_controller=self.stepsize_controller)
-            return sol.ys  # state sequence
-
-        @jax.jit
-        def output_fcn(x, u, params):
-            X = state_prediction(x, u, params)
-            # return the entire (possibly multivariate) output sequence as one vector
-            return output_values(X, Uy, T, params).reshape(-1)
-
-        return state_prediction, output_fcn
+        state_prediction, output_prediction = self._make_fit_functions_()
+        return self._bind_fit_experiment_(
+            U, T, Tu, state_prediction, output_prediction)
 
     def prepare_fit_(self, U, T, Tu):
         """Prepare the model for fitting by setting up the input-output data and the ODE solver.
@@ -227,11 +243,18 @@ class CTModel(Model):
         self._fit_times = [T]
         self._fit_prediction_functions = [output_fcn]
         self._fit_state_prediction_functions = [state_prediction]
+        self._fit_batch_prediction = None
         return
 
     def _predict_experiment(self, x0, U, params, experiment_index, forward_step):
         """Integrate one prepared continuous-time experiment."""
         return self._fit_prediction_functions[experiment_index](x0, U, params)
+
+    def _predict_experiments(self, x0, U, params, forward_step):
+        if self._fit_batch_prediction is None:
+            return super()._predict_experiments(x0, U, params, forward_step)
+        return self._fit_batch_prediction(
+            jnp.stack(x0), jnp.stack(U), params)
 
     def _loss_experiment(self, Yhat, Y, experiment_index):
         """Compute one experiment's output loss using its own time vector."""
@@ -254,13 +277,13 @@ class CTModel(Model):
         Parameters
         ----------
         Y : ndarray or list of ndarrays
-            Training output data. For multiple experiments, provide one N_i-by-ny array per experiment.
+            Training output data. Multiple experiment arrays must have equal lengths.
         U : ndarray or list of ndarrays
-            Training input data. For multiple experiments, provide one N_i-by-nu array per experiment.
-        T: ndarray or list of ndarrays
-            Output time points, either shared or provided separately for each experiment.
-        Tu: ndarray or list of ndarrays
-            Input time points, either shared or provided separately for each experiment. If None, Tu=T.
+            Training input data. Multiple experiment arrays must have equal sizes and lengths.
+        T: ndarray
+            Shared output time points for all experiments.
+        Tu: ndarray
+            Shared input time points for all experiments. If None, Tu=T.
         """
 
         if not self.has_integration_options:
@@ -269,18 +292,33 @@ class CTModel(Model):
 
         U_experiments = U if isinstance(U, list) else [U]
         Nexp = len(U_experiments)
-        Ts = T if isinstance(T, list) and len(T) == Nexp else [T] * Nexp
-        Tus = Ts if Tu is None else (
-            Tu if isinstance(Tu, list) and len(Tu) == Nexp else [Tu] * Nexp)
+        T = jnp.asarray(T)
+        Tu = T if Tu is None else jnp.asarray(Tu)
 
-        prepared = [self._prepare_fit_experiment_(U_experiments[i], Ts[i], Tus[i])
-                    for i in range(Nexp)]
-        self._fit_times = Ts
-        self._fit_prediction_functions = [item[1] for item in prepared]
-        self._fit_state_prediction_functions = [item[0] for item in prepared]
-        self.Ty = Ts[0]
-        self.state_prediction = prepared[0][0]
-        self.output_fcn = prepared[0][1]
+        state_prediction, output_prediction = self._make_fit_functions_()
+        state_prediction_first, output_prediction_first = self._bind_fit_experiment_(
+            U_experiments[0], T, Tu, state_prediction, output_prediction)
+
+        @jax.jit
+        def state_prediction_shared(x, U, params):
+            return state_prediction(x, U, T, Tu, params)
+
+        @jax.jit
+        def output_prediction_shared(x, U, params):
+            return output_prediction(x, U, T, Tu, params)
+
+        @jax.jit
+        def batch_prediction(x0, U_batch, params):
+            return jax.vmap(output_prediction, in_axes=[0, 0, None, None, None])(
+                x0, U_batch, T, Tu, params)
+
+        self._fit_times = [T] * Nexp
+        self._fit_prediction_functions = [output_prediction_shared] * Nexp
+        self._fit_state_prediction_functions = [state_prediction_shared] * Nexp
+        self._fit_batch_prediction = batch_prediction
+        self.Ty = T
+        self.state_prediction = state_prediction_first
+        self.output_fcn = output_prediction_first
 
         super().fit(Y, U)
 
@@ -296,13 +334,13 @@ class CTModel(Model):
         Parameters
         ----------
         Y : ndarray or list of ndarrays
-            Training output data. For multiple experiments, provide one N_i-by-ny array per experiment.
+            Training output data. Multiple experiment arrays must have equal lengths.
         U : ndarray or list of ndarrays
-            Training input data. For multiple experiments, provide one N_i-by-nu array per experiment.
-        T: ndarray or list of ndarrays
-            Output time points, either shared or provided separately for each experiment.
-        Tu: ndarray or list of ndarrays
-            Input time points, either shared or provided separately for each experiment. If None, Tu=T.
+            Training input data. Multiple experiment arrays must have equal sizes and lengths.
+        T: ndarray
+            Shared output time points for all experiments.
+        Tu: ndarray
+            Shared input time points for all experiments. If None, Tu=T.
         init_fcn : function
             A function that initializes the model parameters given a seed.
         seeds : array
