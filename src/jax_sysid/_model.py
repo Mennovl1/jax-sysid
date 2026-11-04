@@ -284,6 +284,19 @@ class Model(object):
         self.isInitialized = True
         return
 
+    def _predict_experiment(self, x0, U, params, experiment_index, forward_step):
+        """Predict one experiment using its initial state and inputs."""
+        _, Yhat = jax.lax.scan(forward_step, x0, U)
+        return Yhat
+
+    def _loss_experiment(self, Yhat, Y, experiment_index):
+        """Compute the output loss for one experiment."""
+        return self.output_loss(Yhat, Y)
+
+    def _fit_state_trajectory(self, x0, U, experiment_index):
+        """Return the state trajectory used by the post-fit saturation check."""
+        return Model.predict(self, x0, U, 0, 0)[1]
+
     def fit(self, Y, U):
         """Train a dynamical model using input-output data.
 
@@ -458,8 +471,9 @@ class Model(object):
                 f = partial(SS_forward, th=th, sat=self.xsat)
                 cost = 0.
                 for i in range(Nexp):
-                    _, Yhat = jax.lax.scan(f, x0[i], U[i])
-                    cost += self.output_loss(Yhat, Y[i])
+                    Yhat = self._predict_experiment(
+                        x0[i], U[i], th, i, f)
+                    cost += self._loss_experiment(Yhat, Y[i], i)
                 return cost
 
             t_solve = time.time()
@@ -711,7 +725,7 @@ class Model(object):
         # Check if state saturation is active.
         for i in range(Nexp):
             # this overrides possible predict() methods defined in subclasses
-            _, Xt = Model.predict(self, x0[i], U[i], 0, 0)
+            Xt = self._fit_state_trajectory(x0[i], U[i], i)
             sat_activated = np.any(Xt > self.xsat) or np.any(Xt < -self.xsat)
             if sat_activated:
                 print(

@@ -146,6 +146,7 @@ class CTModel(Model):
             Additional custom regularization term, a function of the model parameters and initial state
             custom_regularization(params, x0).
         """
+        self._uses_default_output_loss = output_loss is None
         if output_loss is None:
             def output_loss(Yhat, Y):
                 # Use trapezoidal rule for integration
@@ -166,17 +167,10 @@ class CTModel(Model):
             self.custom_regularization = custom_regularization
         return
 
-    def prepare_fit_(self, U, T, Tu):
-        """Prepare the model for fitting by setting up the input-output data and the ODE solver.
-        """
-
-        if not self.has_integration_options:
-            raise ValueError(
-                "Integration options not set. Use the integration_options method to set the ODE solver and other options.")
-
+    def _prepare_fit_experiment_(self, U, T, Tu):
+        """Prepare interpolation and prediction functions for one experiment."""
         if Tu is None:
             Tu = T
-        self.Ty = T  # used to evaluate loss function
 
         input_fcn = self.input_fcn_gen(Tu, U)
         dt0 = self.dt0_fcn(Tu)
@@ -209,7 +203,6 @@ class CTModel(Model):
                 sol = diffrax.diffeqsolve(term, self.ode_solver, t0=t0, t1=t1, dt0=dt0, y0=x, args=params,
                                           saveat=saveat, max_steps=self.max_steps, stepsize_controller=self.stepsize_controller)
             return sol.ys  # state sequence
-        self.state_prediction = state_prediction
 
         @jax.jit
         def output_fcn(x, u, params):
@@ -217,8 +210,42 @@ class CTModel(Model):
             # return the entire (possibly multivariate) output sequence as one vector
             return output_values(X, Uy, T, params).reshape(-1)
 
+        return state_prediction, output_fcn
+
+    def prepare_fit_(self, U, T, Tu):
+        """Prepare the model for fitting by setting up the input-output data and the ODE solver.
+        """
+        if not self.has_integration_options:
+            raise ValueError(
+                "Integration options not set. Use the integration_options method to set the ODE solver and other options.")
+        if Tu is None:
+            Tu = T
+        self.Ty = T  # used to evaluate loss function
+        state_prediction, output_fcn = self._prepare_fit_experiment_(U, T, Tu)
+        self.state_prediction = state_prediction
         self.output_fcn = output_fcn
+        self._fit_times = [T]
+        self._fit_prediction_functions = [output_fcn]
+        self._fit_state_prediction_functions = [state_prediction]
         return
+
+    def _predict_experiment(self, x0, U, params, experiment_index, forward_step):
+        """Integrate one prepared continuous-time experiment."""
+        return self._fit_prediction_functions[experiment_index](x0, U, params)
+
+    def _loss_experiment(self, Yhat, Y, experiment_index):
+        """Compute one experiment's output loss using its own time vector."""
+        if self._uses_default_output_loss:
+            T = self._fit_times[experiment_index]
+            loss_t = (Yhat.reshape(-1, self.ny) - Y.reshape(-1, self.ny))**2
+            return jnp.sum((loss_t[1:, :] + loss_t[:-1, :]) *
+                           jnp.diff(T).reshape(-1, 1)) / (T[-1] - T[0]) / 2.
+        return self.output_loss(Yhat, Y)
+
+    def _fit_state_trajectory(self, x0, U, experiment_index):
+        """Integrate states once for the post-fit saturation check."""
+        return self._fit_state_prediction_functions[experiment_index](
+            x0, U, self.params)
 
     def fit(self, Y, U, T, Tu=None):
         """Fit the continuous-time model to input-output data.
@@ -226,19 +253,36 @@ class CTModel(Model):
 
         Parameters
         ----------
-        Y : ndarray
-            Training dataset: output data. Y must be a N-by-ny numpy array.
-        U : ndarray
-            Training dataset: input data. U must be a N-by-nu numpy array.
-        T: ndarray
-            Time points corresponding to the output data.
-        Tu: ndarray
-            Time points corresponding to the input data. If None, Tu=T.
+        Y : ndarray or list of ndarrays
+            Training output data. For multiple experiments, provide one N_i-by-ny array per experiment.
+        U : ndarray or list of ndarrays
+            Training input data. For multiple experiments, provide one N_i-by-nu array per experiment.
+        T: ndarray or list of ndarrays
+            Output time points, either shared or provided separately for each experiment.
+        Tu: ndarray or list of ndarrays
+            Input time points, either shared or provided separately for each experiment. If None, Tu=T.
         """
 
-        self.prepare_fit_(U=U, T=T, Tu=Tu)
+        if not self.has_integration_options:
+            raise ValueError(
+                "Integration options not set. Use the integration_options method to set the ODE solver and other options.")
 
-        super().fit(Y.reshape(1, -1), jnp.zeros((1, self.nu)))  # pass dummy input data
+        U_experiments = U if isinstance(U, list) else [U]
+        Nexp = len(U_experiments)
+        Ts = T if isinstance(T, list) and len(T) == Nexp else [T] * Nexp
+        Tus = Ts if Tu is None else (
+            Tu if isinstance(Tu, list) and len(Tu) == Nexp else [Tu] * Nexp)
+
+        prepared = [self._prepare_fit_experiment_(U_experiments[i], Ts[i], Tus[i])
+                    for i in range(Nexp)]
+        self._fit_times = Ts
+        self._fit_prediction_functions = [item[1] for item in prepared]
+        self._fit_state_prediction_functions = [item[0] for item in prepared]
+        self.Ty = Ts[0]
+        self.state_prediction = prepared[0][0]
+        self.output_fcn = prepared[0][1]
+
+        super().fit(Y, U)
 
         return
 
@@ -251,14 +295,14 @@ class CTModel(Model):
 
         Parameters
         ----------
-        Y : ndarray
-            Training dataset: output data. Y must be a N-by-ny numpy array.
-        U : ndarray
-            Training dataset: input data. U must be a N-by-nu numpy array.
-        T: ndarray
-            Time points corresponding to the output data.
-        Tu: ndarray
-            Time points corresponding to the input data. If None, Tu=T.
+        Y : ndarray or list of ndarrays
+            Training output data. For multiple experiments, provide one N_i-by-ny array per experiment.
+        U : ndarray or list of ndarrays
+            Training input data. For multiple experiments, provide one N_i-by-nu array per experiment.
+        T: ndarray or list of ndarrays
+            Output time points, either shared or provided separately for each experiment.
+        Tu: ndarray or list of ndarrays
+            Input time points, either shared or provided separately for each experiment. If None, Tu=T.
         init_fcn : function
             A function that initializes the model parameters given a seed.
         seeds : array
@@ -270,8 +314,6 @@ class CTModel(Model):
         --------
             list: A list of fitted models.
         """
-
-        self.prepare_fit_(U=U, T=T, Tu=Tu)
 
         if n_jobs is None:
             n_jobs = cpu_count()  # Use all available cores by default
@@ -287,7 +329,7 @@ class CTModel(Model):
             #     print(
             #         "\033[1m" + f"Fitting model with seed = {seed} ... " + "\033[0m")
 
-            Model.fit(self, Y.reshape(-1), jnp.zeros((1, self.nu))) # pass dummy input data
+            self.fit(Y, U, T, Tu)
 
             # if self.iprint > -1:
             #     print("\033[1m" + f"Seed = {seed}: done." + "\033[0m")
@@ -402,14 +444,14 @@ class CTModel(Model):
         ----------
         models : list
             List of models to evaluate.
-        Y : ndarray
-            Training dataset: output data. Y must be a N-by-ny numpy array.
-        U : ndarray
-            Training dataset: input data. U must be a N-by-nu numpy array.
-        T: ndarray
-            Time points corresponding to the output data.
-        Tu: ndarray
-            Time points corresponding to the input data. If None, Tu=T.
+        Y : ndarray or list of ndarrays
+            Training output data. For multiple experiments, provide one N_i-by-ny array per experiment.
+        U : ndarray or list of ndarrays
+            Training input data. For multiple experiments, provide one N_i-by-nu array per experiment.
+        T: ndarray or list of ndarrays
+            Output time points, either shared or provided separately for each experiment.
+        Tu: ndarray or list of ndarrays
+            Input time points, either shared or provided separately for each experiment. If None, Tu=T.
         fit : str or function, optional
             Metric to use for evaluating the fit. Default is 'R2', for other supported metrics
             (such as 'BFR', or 'RMSE', or 'Accuracy') see function utils/compute_scores().
@@ -424,7 +466,7 @@ class CTModel(Model):
         Returns
         -------
         score
-            The score of the best model.
+            The score of the best model. For multiple experiments, per-experiment scores are summed.
 
         The model object's parameters are updated with the parameters of the best model.
         """
@@ -433,8 +475,12 @@ class CTModel(Model):
             raise Exception(
                 "\033[1mPlease provide a list of models to compare.\033[0m")
 
-        if Tu is None:
-            Tu = T
+        U_experiments = U if isinstance(U, list) else [U]
+        Y_experiments = Y if isinstance(Y, list) else [Y]
+        Nexp = len(U_experiments)
+        T_experiments = T if isinstance(T, list) and len(T) == Nexp else [T] * Nexp
+        Tu_experiments = T_experiments if Tu is None else (
+            Tu if isinstance(Tu, list) and len(Tu) == Nexp else [Tu] * Nexp)
 
         if isinstance(fit, str):
             def get_score(Y,Yhat):
@@ -446,10 +492,16 @@ class CTModel(Model):
             get_score = fit
 
         def single_score(k):
-            x0 = models[k].learn_x0(U, Y, T, Tu)
-            Yhat, _ = models[k].predict(x0, U, T, Tu)
-            score = get_score(Y, Yhat)
-            return score
+            experiment_scores = []
+            for i in range(Nexp):
+                x0 = models[k].learn_x0(
+                    U_experiments[i], Y_experiments[i], T_experiments[i],
+                    Tu_experiments[i])
+                Yhat, _ = models[k].predict(
+                    x0, U_experiments[i], T_experiments[i], Tu_experiments[i])
+                experiment_scores.append(
+                    get_score(Y_experiments[i], Yhat))
+            return np.sum(experiment_scores, axis=0)
 
         if len(models) == 1:
             self.params = models[0].params

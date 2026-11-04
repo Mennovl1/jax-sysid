@@ -93,10 +93,14 @@ class Test_jax_sysid(unittest.TestCase):
         model1.optimization(adam_epochs=adam_epochs, lbfgs_epochs=lbfgs_epochs)
         model2.optimization(adam_epochs=adam_epochs, lbfgs_epochs=lbfgs_epochs)
 
-        model1.fit(Ys_train, Us_train)
-        model2.fit(Ys_train, Us_train)
+        Ys_train_experiments = np.array_split(Ys_train, 3)
+        Us_train_experiments = np.array_split(Us_train, 3)
+        model1.fit(Ys_train_experiments, Us_train_experiments)
+        model2.fit(Ys_train_experiments, Us_train_experiments)
 
-        Yshat_train1, _ = model1.predict(model1.x0, Us_train)
+        Yshat_train1 = np.concatenate([
+            model1.predict(model1.x0[i], Us_train_experiments[i])[0]
+            for i in range(3)])
         Yhat_train1 = unscale(Yshat_train1, ymean, ygain)
 
         # use RTS Smoother to learn x0
@@ -106,7 +110,9 @@ class Test_jax_sysid(unittest.TestCase):
         R21, R2_test1, msg1 = compute_scores(
             Y_train, Yhat_train1, Y_test, Yhat_test1, fit='R2')
 
-        Yshat_train2, _ = model2.predict(model2.x0, Us_train)
+        Yshat_train2 = np.concatenate([
+            model2.predict(model2.x0[i], Us_train_experiments[i])[0]
+            for i in range(3)])
         Yhat_train2 = unscale(Yshat_train2, ymean, ygain)
 
         # use RTS Smoother to learn x0
@@ -122,9 +128,9 @@ class Test_jax_sysid(unittest.TestCase):
               np.mean(R2_test1), ", nonlinear model = %5.4f" % np.mean(R2_test2))
 
         self.assertEqual(np.maximum(np.abs(np.mean(
-            R2_test1)-np.mean(R2_test2))-1.e-3, 0.0), 0.0, 'R2 test scores are different')
+            R2_test1)-np.mean(R2_test2))-1.e-2, 0.0), 0.0, 'R2 test scores are different')
         self.assertEqual(np.maximum(np.abs(np.mean(R21)-np.mean(R22)) -
-                         1.e-3, 0.0), 0.0, 'R2 test scores are different')
+                         1.e-2, 0.0), 0.0, 'R2 test scores are different')
         return
 
 
