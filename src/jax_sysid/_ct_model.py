@@ -11,7 +11,7 @@ import jax.numpy as jnp
 import jaxopt
 import diffrax
 from joblib import Parallel, delayed, cpu_count
-from jax_sysid.utils import lbfgs_options, compute_scores
+from jax_sysid.utils import lbfgs_options, compute_scores, vec_reshape
 from ._model import Model
 from ._solvers import lbfgs_callback
 
@@ -43,6 +43,7 @@ class CTModel(Model):
 
         self.state_fcn_ct = state_fcn
         self.state_fcn = None
+        self.has_integration_options = False
         if output_fcn is None:
             @jax.jit
             def output_fcn(x, u, t, params):
@@ -89,8 +90,8 @@ class CTModel(Model):
             for k in range(self.nu):
                 if iszoh:
                     # ZOH interpolation, with u(t) = u[k] for t in [Tu[k],Tu[k+1])
-                    Tc, Uc = diffrax.rectilinear_interpolation(np.hstack((
-                        -(Tu[1]-Tu[0]),Tu)), np.hstack((U[:,k],U[-1,k])))
+                    Tc, Uc = diffrax.rectilinear_interpolation(jnp.hstack((
+                        -(Tu[1]-Tu[0]), Tu)), jnp.hstack((U[:, k], U[-1, k])))
                     input_fcn.append(diffrax.LinearInterpolation(ts=Tc, ys=Uc))
                 else:
                     input_fcn.append(diffrax.LinearInterpolation(ts=Tu, ys=U[:,k]))
@@ -166,81 +167,117 @@ class CTModel(Model):
             self.custom_regularization = custom_regularization
         return
 
-    def prepare_fit_(self, U, T, Tu):
-        """Prepare the model for fitting by setting up the input-output data and the ODE solver.
-        """
+    def _make_fit_functions_(self):
+        output_values = jax.vmap(self.output_fcn_ct, in_axes=[0, 0, 0, None])
 
+        @jax.jit
+        def state_prediction(x, U, T, Tu, params):
+            input_fcn = self.input_fcn_gen(Tu, U)
+            dt0 = self.dt0_fcn(Tu)
+
+            def dxdt(t, x, params):
+                u = jnp.array([input_fcn[k].evaluate(t)
+                               for k in range(self.nu)]).reshape(self.nu)
+                return self.state_fcn_ct(x, u, t, params)
+
+            term = diffrax.ODETerm(dxdt)
+            saveat = diffrax.SaveAt(ts=T)
+            if self.stepsize_controller is None:
+                solution = diffrax.diffeqsolve(
+                    term, self.ode_solver, t0=T[0], t1=T[-1], dt0=dt0,
+                    y0=x, args=params, saveat=saveat, max_steps=self.max_steps)
+            else:
+                solution = diffrax.diffeqsolve(
+                    term, self.ode_solver, t0=T[0], t1=T[-1], dt0=dt0,
+                    y0=x, args=params, saveat=saveat, max_steps=self.max_steps,
+                    stepsize_controller=self.stepsize_controller)
+            return solution.ys
+
+        @jax.jit
+        def output_prediction(x, U, T, Tu, params):
+            X = state_prediction(x, U, T, Tu, params)
+            input_fcn = self.input_fcn_gen(Tu, U)
+            Uy = jnp.array([input_fcn[k].evaluate(T)
+                            for k in range(self.nu)]).reshape(-1, self.nu)
+            return output_values(X, Uy, T, params).reshape(-1)
+
+        return state_prediction, output_prediction
+
+    def prepare_fit_(self, U, T, Tu):
+        """Prepare prediction functions for the given input and time vectors."""
         if not self.has_integration_options:
             raise ValueError(
                 "Integration options not set. Use the integration_options method to set the ODE solver and other options.")
 
-        if Tu is None:
-            Tu = T
-        self.Ty = T  # used to evaluate loss function
+        U = jnp.asarray(vec_reshape(U))
+        T = jnp.asarray(T)
+        Tu = T if Tu is None else jnp.asarray(Tu)
+        if T.ndim != 1 or Tu.ndim != 1:
+            raise ValueError("T and Tu must be one-dimensional time vectors")
+        if T.size < 2 or Tu.size < 2:
+            raise ValueError("T and Tu must each contain at least two time points")
+        if U.ndim != 2 or U.shape[0] != Tu.size or U.shape[1] != self.nu:
+            raise ValueError("U must have shape (len(Tu), nu)")
 
-        input_fcn = self.input_fcn_gen(Tu, U)
-        dt0 = self.dt0_fcn(Tu)
-
-        @jax.jit
-        def dxdt(t, x, params):
-            u = jnp.array([input_fcn[k].evaluate(t) for k in range(self.nu)]).reshape(self.nu)
-            return self.state_fcn_ct(x, u, t, params)
-
-        @jax.jit
-        def state_fcn(x, u, params):
-            return x  # do nothing, just return the state
-        self.state_fcn = state_fcn
-
-        # evaluate input at output sample points
-        Uy = jnp.array([input_fcn[k].evaluate(T) for k in range(self.nu)]).reshape(-1,self.nu)
-        output_values = jax.jit(
-            jax.vmap(self.output_fcn_ct, in_axes=[0, 0, 0, None]))
+        self.Ty = T
+        self._fit_T = T
+        self._fit_Tu = Tu
+        self._state_prediction, self._output_prediction = self._make_fit_functions_()
+        self.state_fcn = jax.jit(lambda x, u, params: x)
 
         @jax.jit
-        def state_prediction(x, u, params):
-            term = diffrax.ODETerm(dxdt)
-            t0 = T[0]
-            t1 = T[-1]
-            saveat = diffrax.SaveAt(ts=jnp.array(T))
-            if self.stepsize_controller is None:
-                sol = diffrax.diffeqsolve(term, self.ode_solver, t0=t0, t1=t1, dt0=dt0,
-                                          y0=x, args=params, saveat=saveat, max_steps=self.max_steps)
-            else:
-                sol = diffrax.diffeqsolve(term, self.ode_solver, t0=t0, t1=t1, dt0=dt0, y0=x, args=params,
-                                          saveat=saveat, max_steps=self.max_steps, stepsize_controller=self.stepsize_controller)
-            return sol.ys  # state sequence
-        self.state_prediction = state_prediction
+        def state_prediction_one(x, u, params):
+            return self._state_prediction(x, U, T, Tu, params)
 
         @jax.jit
-        def output_fcn(x, u, params):
-            X = state_prediction(x, u, params)
-            # return the entire (possibly multivariate) output sequence as one vector
-            return output_values(X, Uy, T, params).reshape(-1)
+        def output_prediction_one(x, u, params):
+            return self._output_prediction(x, U, T, Tu, params)
 
-        self.output_fcn = output_fcn
-        return
+        self.state_prediction = state_prediction_one
+        self.output_fcn = output_prediction_one
+
+    def _predict_experiments(self, x0, U, params, forward_step):
+        return jax.vmap(
+            self._output_prediction, in_axes=[0, 0, None, None, None])(
+                jnp.stack(x0), jnp.stack(U), self._fit_T, self._fit_Tu, params)
+
+    def _fit_state_trajectory(self, x0, U, experiment_index):
+        return self._state_prediction(
+            x0, U, self._fit_T, self._fit_Tu, self.params)
 
     def fit(self, Y, U, T, Tu=None):
-        """Fit the continuous-time model to input-output data.
-        The model is trained by integrating the state-update function using an ODE solver from the diffrax library.
+        """Fit one experiment or a list of equal-shaped experiments.
 
-        Parameters
-        ----------
-        Y : ndarray
-            Training dataset: output data. Y must be a N-by-ny numpy array.
-        U : ndarray
-            Training dataset: input data. U must be a N-by-nu numpy array.
-        T: ndarray
-            Time points corresponding to the output data.
-        Tu: ndarray
-            Time points corresponding to the input data. If None, Tu=T.
+        ``T`` and ``Tu`` are shared by all experiments. Each output must have
+        one row per point in ``T``; each input must have one row per point in
+        ``Tu`` (or ``T`` when ``Tu`` is omitted).
         """
+        U_experiments = list(U) if isinstance(U, list) else [U]
+        Y_experiments = list(Y) if isinstance(Y, list) else [Y]
+        if not U_experiments or len(U_experiments) != len(Y_experiments):
+            raise ValueError("Y and U must contain the same nonzero number of experiments")
 
-        self.prepare_fit_(U=U, T=T, Tu=Tu)
+        U_experiments = [jnp.asarray(vec_reshape(u)) for u in U_experiments]
+        Y_experiments = [jnp.asarray(vec_reshape(y)) for y in Y_experiments]
+        if any(u.ndim != 2 or u.shape[1] != self.nu for u in U_experiments):
+            raise ValueError("Each U experiment must have shape (N, nu)")
+        if any(y.ndim != 2 or y.shape[1] != self.ny for y in Y_experiments):
+            raise ValueError("Each Y experiment must have shape (N, ny)")
+        if any(u.shape != U_experiments[0].shape for u in U_experiments):
+            raise ValueError("All input experiments must have equal shape")
+        if any(y.shape != Y_experiments[0].shape for y in Y_experiments):
+            raise ValueError("All output experiments must have equal shape")
 
-        super().fit(Y.reshape(1, -1), jnp.zeros((1, self.nu)))  # pass dummy input data
+        T = jnp.asarray(T)
+        Tu = T if Tu is None else jnp.asarray(Tu)
+        if T.ndim != 1 or T.size != Y_experiments[0].shape[0]:
+            raise ValueError("T must contain one time point per output sample")
+        if Tu.ndim != 1 or Tu.size != U_experiments[0].shape[0]:
+            raise ValueError("Tu must contain one time point per input sample")
 
-        return
+        self.prepare_fit_(U_experiments[0], T, Tu)
+        Y_fit = [y.reshape(1, -1) for y in Y_experiments]
+        super().fit(Y_fit, U_experiments)
 
     def parallel_fit(
             self, Y, U, T, Tu=None, init_fcn=None, seeds=None, n_jobs=None):
@@ -251,14 +288,14 @@ class CTModel(Model):
 
         Parameters
         ----------
-        Y : ndarray
-            Training dataset: output data. Y must be a N-by-ny numpy array.
-        U : ndarray
-            Training dataset: input data. U must be a N-by-nu numpy array.
+        Y : ndarray or list of ndarrays
+            Output data, with equal-length experiments when provided as a list.
+        U : ndarray or list of ndarrays
+            Input data, with equal-length experiments when provided as a list.
         T: ndarray
-            Time points corresponding to the output data.
+            Shared output time points.
         Tu: ndarray
-            Time points corresponding to the input data. If None, Tu=T.
+            Shared input time points. If None, Tu=T.
         init_fcn : function
             A function that initializes the model parameters given a seed.
         seeds : array
@@ -270,8 +307,6 @@ class CTModel(Model):
         --------
             list: A list of fitted models.
         """
-
-        self.prepare_fit_(U=U, T=T, Tu=Tu)
 
         if n_jobs is None:
             n_jobs = cpu_count()  # Use all available cores by default
@@ -287,7 +322,7 @@ class CTModel(Model):
             #     print(
             #         "\033[1m" + f"Fitting model with seed = {seed} ... " + "\033[0m")
 
-            Model.fit(self, Y.reshape(-1), jnp.zeros((1, self.nu))) # pass dummy input data
+            self.fit(Y, U, T, Tu)
 
             # if self.iprint > -1:
             #     print("\033[1m" + f"Seed = {seed}: done." + "\033[0m")
@@ -396,20 +431,20 @@ class CTModel(Model):
 
     def find_best_model(self, models, Y, U, T, Tu=None, fit='R2', n_jobs=None, verbose=True):
         """
-        Given a list of models, find the model that achieves the highest fit on a given dataset.
+        Find the best model on one or more equal-length experiments.
 
         Parameters
         ----------
         models : list
             List of models to evaluate.
-        Y : ndarray
-            Training dataset: output data. Y must be a N-by-ny numpy array.
-        U : ndarray
-            Training dataset: input data. U must be a N-by-nu numpy array.
-        T: ndarray
-            Time points corresponding to the output data.
-        Tu: ndarray
-            Time points corresponding to the input data. If None, Tu=T.
+        Y : ndarray or list of ndarrays
+            Output data. Experiment arrays must have equal lengths.
+        U : ndarray or list of ndarrays
+            Input data. Experiment arrays must have equal lengths.
+        T : ndarray
+            Shared output time points.
+        Tu : ndarray
+            Shared input time points. If None, Tu=T.
         fit : str or function, optional
             Metric to use for evaluating the fit. Default is 'R2', for other supported metrics
             (such as 'BFR', or 'RMSE', or 'Accuracy') see function utils/compute_scores().
@@ -424,17 +459,20 @@ class CTModel(Model):
         Returns
         -------
         score
-            The score of the best model.
+            The sum of the best model's per-experiment scores.
 
         The model object's parameters are updated with the parameters of the best model.
         """
 
-        if not isinstance(models, list):
-            raise Exception(
-                "\033[1mPlease provide a list of models to compare.\033[0m")
+        if not isinstance(models, list) or not models:
+            raise ValueError("Please provide a nonempty list of models to compare")
 
         if Tu is None:
             Tu = T
+        U_experiments = list(U) if isinstance(U, list) else [U]
+        Y_experiments = list(Y) if isinstance(Y, list) else [Y]
+        if not U_experiments or len(U_experiments) != len(Y_experiments):
+            raise ValueError("Y and U must contain the same nonzero number of experiments")
 
         if isinstance(fit, str):
             def get_score(Y,Yhat):
@@ -446,10 +484,21 @@ class CTModel(Model):
             get_score = fit
 
         def single_score(k):
-            x0 = models[k].learn_x0(U, Y, T, Tu)
-            Yhat, _ = models[k].predict(x0, U, T, Tu)
-            score = get_score(Y, Yhat)
-            return score
+            model = models[k]
+            initial_states = model.x0
+            scores = []
+            if isinstance(initial_states, list) and len(initial_states) != len(U_experiments):
+                raise ValueError("The model must have one initial state per experiment")
+            try:
+                for i, (U_i, Y_i) in enumerate(zip(U_experiments, Y_experiments)):
+                    if isinstance(initial_states, list):
+                        model.x0 = initial_states[i]
+                    x0 = model.learn_x0(U_i, Y_i, T, Tu)
+                    Yhat, _ = model.predict(x0, U_i, T, Tu)
+                    scores.append(get_score(Y_i, Yhat))
+            finally:
+                model.x0 = initial_states
+            return np.sum(scores, axis=0)
 
         if len(models) == 1:
             self.params = models[0].params
